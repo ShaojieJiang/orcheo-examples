@@ -5,7 +5,7 @@
 - **Version:** 0.1
 - **Author:** ShaojieJiang
 - **Date:** 2026-02-23
-- **Status:** Draft
+- **Status:** Approved
 
 ---
 
@@ -24,6 +24,10 @@ Both workflows communicate with external WeChat users exclusively through the We
 - **Daily Reminder Workflow (cron-triggered)**
   - Fetches all active registered users and sends personalised reminders via SubWorkflow iteration
   - Key nodes: CronTriggerNode, WeComAccessTokenNode, MongoDBFindNode, PrepareIterationNode (custom), SelectCurrentUserNode (custom), SubWorkflowNode, IncrementCounterNode (custom), WeComCustomerServiceSendNode
+
+- **DB Setup Workflow (manual trigger)**
+  - One-time (idempotent) admin workflow to create the required MongoDB database, collections, and indexes
+  - Key nodes: MongoDBNode (create_index)
 
 - **MongoDB (shared storage)**
   - `registered_users` collection: user profiles with reminder items
@@ -80,6 +84,13 @@ Both workflows communicate with external WeChat users exclusively through the We
 4. Agent calls `mongodb_update_one` on `user_records` with `upsert: true`, using filter `{"external_userid": "<id>", "record_date": "<today>"}` and the extracted status data
 5. Agent generates a confirmation reply (e.g., "已记录今日状态：降压药已服用，血压130/85")
 6. Reply is sent to user via `WeComCustomerServiceSendNode`
+
+### Flow 5: Database Setup (Admin)
+
+1. Admin triggers the DB Setup workflow manually via `orcheo workflow run`
+2. `create_registered_users_index` node (MongoDBNode, operation: `create_index`) creates an ascending index on `external_userid` in the `registered_users` collection — implicitly creating the database and collection if they don't exist
+3. `create_user_records_index` node (MongoDBNode, operation: `create_index`) creates a compound ascending index on `{external_userid, record_date}` in the `user_records` collection — implicitly creating the collection if it doesn't exist
+4. Both operations are idempotent: re-running the workflow is safe
 
 ## API Contracts
 
@@ -276,6 +287,21 @@ MongoDB 配置：
 | `increment_counter` | `select_current_user` | While: `index < total` |
 | `increment_counter` | END | While: `index >= total` (done) |
 
+### DB Setup Workflow Nodes
+
+| Node Name | Node Type | Key Configuration |
+|-----------|-----------|-------------------|
+| `create_registered_users_index` | MongoDBNode | `operation: "create_index"`, `collection: "registered_users"`, `keys: {"external_userid": 1}`, `kwargs: {"name": "idx_external_userid"}` |
+| `create_user_records_index` | MongoDBNode | `operation: "create_index"`, `collection: "user_records"`, `keys: {"external_userid": 1, "record_date": 1}`, `kwargs: {"name": "idx_userid_date"}` |
+
+### DB Setup Workflow Edges
+
+| From | To | Condition |
+|------|----|-----------|
+| START | `create_registered_users_index` | (entry point) |
+| `create_registered_users_index` | `create_user_records_index` | (unconditional) |
+| `create_user_records_index` | END | (unconditional) |
+
 ## Security Considerations
 
 - **WeCom signature validation**: All incoming callbacks are verified by WeComEventsParserNode using the Token and EncodingAESKey
@@ -317,3 +343,4 @@ MongoDB 配置：
 | Date | Author | Changes |
 |------|--------|---------|
 | 2026-02-23 | ShaojieJiang | Initial draft |
+| 2026-02-23 | ShaojieJiang | Added DB Setup workflow (Flow 5) for admin-driven MongoDB provisioning |

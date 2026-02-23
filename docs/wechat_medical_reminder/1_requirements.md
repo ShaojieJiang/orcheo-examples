@@ -31,6 +31,7 @@ Individuals who need daily medical reminders (e.g., medication intake, blood pre
 | Registered user | Send a message expressing my wish to deregister | I stop receiving reminders and my data is removed | P0 | Agent confirms intent before deregistering; sets user status to inactive in `registered_users`; confirms completion |
 | Registered user | Receive a daily reminder at 9:00 AM with my personalised items | I am prompted to complete my health tasks and report back | P0 | All active registered users receive a personalised reminder message every day at 09:00 Asia/Shanghai |
 | Registered user | Reply to the reminder with my status in free-form text | My daily health record is saved for future reference | P0 | Agent parses the reply and stores a structured record in `user_records`; confirms receipt |
+| Admin | Run a setup workflow to create the required MongoDB database and collections with proper indexes | The infrastructure is ready before deploying the main workflows | P0 | Running the DB Setup workflow creates `registered_users` (index on `external_userid`) and `user_records` (compound index on `{external_userid, record_date}`) collections; workflow is idempotent |
 | Registered user | Update my reminder items or phone number | My registration reflects the latest preferences | P1 | Agent updates the existing `registered_users` entry |
 
 ### Context, Problems, Opportunities
@@ -82,6 +83,13 @@ Many people need daily health reminders (medication, measurements, exercises) bu
    - Agent processes the reply and extracts relevant status information
    - Store each report as a new document in `user_records` with the user's ID, date, and processed data
    - Confirm receipt to user
+
+5. **Database & Collection Setup (Admin Workflow)**
+   - A dedicated Orcheo workflow that admins run once (or re-run idempotently) to provision the MongoDB infrastructure
+   - Creates the `registered_users` collection with an index on `external_userid`
+   - Creates the `user_records` collection with a compound index on `{external_userid, record_date}`
+   - Uses Orcheo's built-in `MongoDBNode` with `create_index` operation (which implicitly creates database and collection if they don't exist)
+   - Configurable database and collection names via `workflow_config.json`
 
 #### P1 - Future Enhancements
 

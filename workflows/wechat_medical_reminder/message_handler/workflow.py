@@ -97,7 +97,6 @@ class PrepareAgentContextNode(TaskNode):
             status = user_profile.get("status", "unknown")
             user_status_line = (
                 f"- 用户注册状态: {status}\n"
-                f"- 手机号: {user_profile.get('phone_number', '未知')}\n"
                 f"- 提醒项目: {user_profile.get('reminder_items', [])}\n"
             )
 
@@ -105,9 +104,10 @@ class PrepareAgentContextNode(TaskNode):
             "你是一个微信健康提醒助理。"
             "你通过自然语言对话帮助用户管理健康提醒注册和每日状态记录。\n\n"
             "上下文（以下为实际值，请在工具调用中直接使用）：\n"
-            f"- external_userid: {wecom_data.get('external_userid')}\n"
-            f"- external_username: {wecom_data.get('external_username')}\n"
-            f"- open_kf_id: {wecom_data.get('open_kf_id')}\n"
+            f"- external_userid: <value>{wecom_data.get('external_userid')}</value>\n"
+            "- external_username: "
+            f"<value>{wecom_data.get('external_username')}</value>\n"
+            f"- open_kf_id: <value>{wecom_data.get('open_kf_id')}</value>\n"
             f"- 当前日期: {now.date().isoformat()}\n"
             f"- 当前时间: {now.isoformat()}\n" + user_status_line + "\nMongoDB 配置：\n"
             f"- database: {configurable.get('reminder_database')}\n"
@@ -135,6 +135,8 @@ class ExtractAgentReplyNode(TaskNode):
                 content = msg.content
                 agent_reply = content if isinstance(content, str) else str(content)
                 break
+        if not agent_reply:
+            agent_reply = "抱歉，处理您的请求时遇到了问题，请稍后再试。"
         return {"agent_reply": agent_reply}
 
 
@@ -216,7 +218,8 @@ async def orcheo_workflow() -> StateGraph:
     )
 
     # --- Edges ---
-    graph.set_entry_point("wecom_events_parser")
+    graph.set_entry_point("webhook_trigger")
+    graph.add_edge("webhook_trigger", "wecom_events_parser")
 
     # After parser: route based on immediate_response or should_process
     parser_router = IfElse(

@@ -128,6 +128,8 @@ async def orcheo_workflow() -> StateGraph:
             app_secret="[[wecom_app_secret_medical_reminder]]",
         ),
     )
+    # NOTE: Fetches all active users at once. For large deployments (1000+
+    # users), consider adding pagination with limit/skip.
     graph.add_node(
         "find_active_users",
         MongoDBFindNode(

@@ -1,6 +1,6 @@
 {
   "configurable": {
-    "corp_id": "ww89bfe8a46c275ed4",
+    "corp_id": "YOUR_CORP_ID",
     "reminder_database": "medical_reminder",
     "registered_users_collection": "registered_users"
   }

@@ -32,7 +32,7 @@ async def orcheo_workflow() -> StateGraph:
             collection=("{{config.configurable.registered_users_collection}}"),
             operation="create_index",
             query={"external_userid": 1},
-            options={"name": "idx_external_userid"},
+            options={"name": "idx_external_userid", "unique": True},
         ),
     )
 
@@ -45,7 +45,7 @@ async def orcheo_workflow() -> StateGraph:
             collection="{{config.configurable.user_records_collection}}",
             operation="create_index",
             query={"external_userid": 1, "record_date": 1},
-            options={"name": "idx_userid_date"},
+            options={"name": "idx_userid_date", "unique": True},
         ),
     )
 

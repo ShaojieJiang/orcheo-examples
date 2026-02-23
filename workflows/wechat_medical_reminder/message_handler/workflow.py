@@ -8,6 +8,7 @@ Configurable inputs (workflow_config.json):
 - reminder_database (MongoDB database name)
 - registered_users_collection (collection for user profiles)
 - user_records_collection (collection for status reports)
+- timezone_offset_hours (UTC offset for date context, default 8 for Asia/Shanghai)
 
 Orcheo vault secrets required:
 - wecom_app_secret_medical_reminder: WeCom app secret for access token
@@ -17,7 +18,7 @@ Orcheo vault secrets required:
 - openai_api_key: OpenAI API key for the LLM agent
 """
 
-from datetime import UTC, datetime
+from datetime import datetime, timedelta, timezone
 from typing import Any
 from langchain_core.runnables import RunnableConfig
 from langgraph.graph import END, StateGraph
@@ -82,9 +83,10 @@ class PrepareAgentContextNode(TaskNode):
 
     async def run(self, state: State, config: RunnableConfig) -> dict[str, Any]:
         """Assemble a system prompt with user profile and MongoDB config."""
-        now = datetime.now(UTC)
         wecom_data = state.get("results", {}).get("wecom_cs_sync", {})
         configurable = config.get("configurable", {})
+        offset_hours = configurable.get("timezone_offset_hours", 8)
+        now = datetime.now(timezone(timedelta(hours=offset_hours)))
 
         # Extract user profile from the lookup_user query result.
         lookup_data = state.get("results", {}).get("lookup_user", {}).get("data", [])
@@ -129,7 +131,7 @@ class ExtractAgentReplyNode(TaskNode):
                 if msg.get("role") == "assistant":
                     agent_reply = str(msg.get("content", ""))
                     break
-            elif hasattr(msg, "type") and msg.type == "ai" and msg.content:
+            elif not isinstance(msg, dict) and msg.type == "ai" and msg.content:
                 content = msg.content
                 agent_reply = content if isinstance(content, str) else str(content)
                 break

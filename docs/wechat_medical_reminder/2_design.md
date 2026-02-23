@@ -1,0 +1,319 @@
+# Design Document
+
+## For WeChat Medical Reminder
+
+- **Version:** 0.1
+- **Author:** ShaojieJiang
+- **Date:** 2026-02-23
+- **Status:** Draft
+
+---
+
+## Overview
+
+The WeChat Medical Reminder system is built on the Orcheo workflow platform and consists of two workflows that share two MongoDB collections. The **Message Handler Workflow** processes incoming WeChat messages via WeCom Customer Service webhooks. An AI agent (AgentNode) interprets user intent and manages registration, deregistration, and status reporting through MongoDB tool calls. The **Daily Reminder Workflow** runs on a cron schedule at 9:00 AM Asia/Shanghai, retrieves all active users, and sends personalised reminders through a SubWorkflow-per-user iteration pattern.
+
+Both workflows communicate with external WeChat users exclusively through the WeCom Customer Service (微信客服) channel, requiring no WeCom internal account on the user's side.
+
+## Components
+
+- **Message Handler Workflow (webhook-triggered)**
+  - Receives WeCom callback events, validates signatures, syncs customer service messages, and routes them to an AI agent for processing
+  - Key nodes: WebhookTriggerNode, WeComEventsParserNode, WeComAccessTokenNode, WeComCustomerServiceSyncNode, AgentNode, ExtractAgentReplyNode, WeComCustomerServiceSendNode
+
+- **Daily Reminder Workflow (cron-triggered)**
+  - Fetches all active registered users and sends personalised reminders via SubWorkflow iteration
+  - Key nodes: CronTriggerNode, WeComAccessTokenNode, MongoDBFindNode, PrepareIterationNode (custom), SelectCurrentUserNode (custom), SubWorkflowNode, IncrementCounterNode (custom), WeComCustomerServiceSendNode
+
+- **MongoDB (shared storage)**
+  - `registered_users` collection: user profiles with reminder items
+  - `user_records` collection: daily status reports
+
+- **Orcheo Vault (secrets)**
+  - WeCom credentials, MongoDB connection string, LLM API key
+
+## Request Flows
+
+### Flow 1: User Registration
+
+1. WeChat user sends a message to the WeCom Customer Service account with their reminder items and phone number (e.g., "我想注册提醒，每天吃降压药、测血压，手机号13800138000")
+2. WeCom sends a callback to the Orcheo webhook endpoint
+3. `WeComEventsParserNode` validates the signature and parses the callback
+4. `WeComAccessTokenNode` fetches/caches the access token
+5. `WeComCustomerServiceSyncNode` syncs the user's message and extracts `external_userid` and `open_kf_id`
+6. `AgentNode` receives the message with conversation history and context (external_userid, open_kf_id)
+7. Agent calls `mongodb_find` on `registered_users` to check if user already exists
+8. If user does not exist: Agent calls `mongodb_update_one` with `upsert: true` to create the registration
+9. Agent generates a confirmation reply summarising the registered items
+10. `ExtractAgentReplyNode` extracts the agent's reply text
+11. `WeComCustomerServiceSendNode` sends the reply back to the user
+
+### Flow 2: User Deregistration
+
+1. Registered user sends a message expressing deregistration intent (e.g., "我不想再接收提醒了")
+2. Steps 2-6 same as Flow 1
+3. Agent detects deregistration intent and replies asking for confirmation (e.g., "确定要取消提醒服务吗？请回复'确认'")
+4. Reply is sent to user via `WeComCustomerServiceSendNode`
+5. User sends confirmation message (e.g., "确认")
+6. A new webhook invocation processes this message; the AgentNode sees the prior conversation history (via LangGraph checkpointing) and recognises the confirmation
+7. Agent calls `mongodb_update_one` on `registered_users` to set `status: "inactive"`
+8. Agent generates a deregistration confirmation reply
+9. Reply is sent to user
+
+### Flow 3: Daily Reminder (Cron)
+
+1. `CronTriggerNode` fires at 09:00 Asia/Shanghai daily
+2. `WeComAccessTokenNode` fetches/caches the access token
+3. `MongoDBFindNode` queries `registered_users` with filter `{"status": "active"}`
+4. `PrepareIterationNode` reads the user list and initialises iteration state (`index: 0`, `total: N`)
+5. `While` edge checks: `index < total`
+6. `SelectCurrentUserNode` picks the user at the current index and prepares a personalised reminder message from their `reminder_items`
+7. `SubWorkflowNode` executes a mini-workflow containing `WeComCustomerServiceSendNode` to deliver the message to that user
+8. `IncrementCounterNode` advances the index
+9. Loop continues from step 5 until all users have been sent reminders
+
+### Flow 4: User Status Report
+
+1. Registered user sends a status report message (e.g., "今天药已经吃了，血压130/85")
+2. Steps 2-6 same as Flow 1
+3. Agent detects status-report intent, extracts structured data from the message
+4. Agent calls `mongodb_update_one` on `user_records` with `upsert: true`, using filter `{"external_userid": "<id>", "record_date": "<today>"}` and the extracted status data
+5. Agent generates a confirmation reply (e.g., "已记录今日状态：降压药已服用，血压130/85")
+6. Reply is sent to user via `WeComCustomerServiceSendNode`
+
+## API Contracts
+
+### Webhook Endpoint (Message Handler Workflow)
+
+```
+GET/POST /api/workflows/{workflow_id}/triggers/webhook?preserve_raw_body=true
+
+WeCom sends callbacks to this endpoint.
+- GET with echostr: URL verification (handled by WeComEventsParserNode)
+- POST with encrypted XML: Message callbacks
+```
+
+### Orcheo Vault Credentials
+
+```
+wecom_app_secret       - WeCom app secret for access token
+wecom_token            - Callback token for signature validation
+wecom_encoding_aes_key - AES key for callback decryption
+mdb_connection_string  - MongoDB connection string
+openai_api_key         - OpenAI API key for the LLM agent
+```
+
+### Workflow Configurable Inputs
+
+These values should be specified in the workflow's config file (e.g., `workflow.json`):
+
+```json
+{
+  "configurable": {
+    "corp_id": "<WeCom corp ID>",
+    "reminder_database": "<MongoDB database name>",
+    "registered_users_collection": "registered_users",
+    "user_records_collection": "user_records"
+  }
+}
+```
+
+## Data Models / Schemas
+
+### registered_users Collection
+
+| Field | Type | Description |
+|-------|------|-------------|
+| external_userid | string | WeChat external user ID from WeCom Customer Service sync |
+| open_kf_id | string | WeCom Customer Service account ID (required for sending messages) |
+| phone_number | string | User's phone number |
+| reminder_items | string[] | List of personalised reminder items (e.g., ["吃降压药", "测血压"]) |
+| status | string | `"active"` or `"inactive"` (soft-delete for deregistration) |
+| registered_at | string | ISO 8601 datetime of initial registration |
+| updated_at | string | ISO 8601 datetime of last update |
+
+```json
+{
+  "external_userid": "wmXXXXXXXXXX",
+  "open_kf_id": "wkXXXXXXXXXX",
+  "phone_number": "13800138000",
+  "reminder_items": ["吃降压药", "测血压", "30分钟步行"],
+  "status": "active",
+  "registered_at": "2026-02-23T10:30:00+08:00",
+  "updated_at": "2026-02-23T10:30:00+08:00"
+}
+```
+
+### user_records Collection
+
+| Field | Type | Description |
+|-------|------|-------------|
+| external_userid | string | WeChat external user ID (foreign key to registered_users) |
+| record_date | string | Date of the record in `YYYY-MM-DD` format |
+| raw_text | string | Original user message text |
+| items_status | object | Structured status per reminder item |
+| recorded_at | string | ISO 8601 datetime when the record was stored |
+
+```json
+{
+  "external_userid": "wmXXXXXXXXXX",
+  "record_date": "2026-02-23",
+  "raw_text": "今天药已经吃了，血压130/85，没有走路",
+  "items_status": {
+    "吃降压药": "已完成",
+    "测血压": "130/85",
+    "30分钟步行": "未完成"
+  },
+  "recorded_at": "2026-02-23T11:15:00+08:00"
+}
+```
+
+## Agent System Prompt (Message Handler)
+
+The AgentNode in the Message Handler Workflow uses the following system prompt:
+
+```
+你是一个微信健康提醒助理。你通过自然语言对话帮助用户管理健康提醒注册和每日状态记录。
+
+上下文：
+- external_userid: {{wecom_cs_sync.external_userid}}
+- open_kf_id: {{wecom_cs_sync.open_kf_id}}
+- 当前日期: 使用 ISO 8601 格式
+
+MongoDB 配置：
+- database: 使用 configurable 中的 reminder_database
+- registered_users collection: registered_users
+- user_records collection: user_records
+
+工具：
+- mongodb_find：查询文档（支持 filter/sort/limit）
+- mongodb_update_one：更新或插入文档（支持 filter/update/options）
+
+你负责以下任务：
+
+1. 用户注册：
+   - 从用户消息中提取提醒项目列表和手机号
+   - 先用 mongodb_find 检查 registered_users 中是否已存在该 external_userid
+   - 如不存在，用 mongodb_update_one (upsert: true) 创建记录，包含：
+     external_userid, open_kf_id, phone_number, reminder_items, status: "active",
+     registered_at, updated_at
+   - 如已存在且 status 为 active，提示用户已注册
+   - 确认注册并列出已保存的提醒项目
+
+2. 用户注销：
+   - 检测用户注销意图时，先回复确认请求（如"确定要取消提醒服务吗？请回复'确认'"）
+   - 收到确认后，用 mongodb_update_one 将 status 设为 "inactive"，更新 updated_at
+   - 确认注销完成
+
+3. 状态报告：
+   - 用户报告每日健康状态时，提取各提醒项目的完成情况
+   - 用 mongodb_update_one (upsert: true) 在 user_records 中创建记录：
+     filter: {"external_userid": "<id>", "record_date": "<YYYY-MM-DD>"}
+     update: {"$set": {raw_text, items_status, recorded_at, external_userid, record_date}}
+   - 确认已记录并总结状态
+
+4. 其他消息：
+   - 如用户消息不属于以上类别，友好地介绍你的功能并引导用户
+
+指南：
+- 所有回复使用中文纯文本，不要输出 JSON 或 Markdown
+- 对破坏性操作（注销）必须先确认
+- 手机号格式验证：中国大陆手机号（11位，1开头）
+- 提醒项目应以简洁短语存储
+```
+
+## Node & Edge Configuration
+
+### Message Handler Workflow Nodes
+
+| Node Name | Node Type | Key Configuration |
+|-----------|-----------|-------------------|
+| `webhook_trigger` | WebhookTriggerNode | `allowed_methods: ["GET", "POST"]` |
+| `wecom_events_parser` | WeComEventsParserNode | `corp_id: {{config.configurable.corp_id}}` |
+| `get_cs_access_token` | WeComAccessTokenNode | `corp_id: {{config.configurable.corp_id}}` |
+| `wecom_cs_sync` | WeComCustomerServiceSyncNode | (defaults) |
+| `agent` | AgentNode | `ai_model: "openai:gpt-4o-mini"`, `predefined_tools: ["mongodb_find", "mongodb_update_one"]`, system prompt above |
+| `extract_agent_reply` | ExtractAgentReplyNode | (custom TaskNode) |
+| `send_cs_reply` | WeComCustomerServiceSendNode | `message: {{extract_agent_reply.agent_reply}}` |
+
+### Message Handler Workflow Edges
+
+| From | To | Condition |
+|------|----|-----------|
+| START | `wecom_events_parser` | (entry point) |
+| `wecom_events_parser` | END | If `immediate_response` is truthy OR `should_process` is falsy |
+| `wecom_events_parser` | `get_cs_access_token` | Otherwise |
+| `get_cs_access_token` | `wecom_cs_sync` | (unconditional) |
+| `wecom_cs_sync` | END | If `should_process` is falsy |
+| `wecom_cs_sync` | `agent` | Otherwise |
+| `agent` | `extract_agent_reply` | (unconditional) |
+| `extract_agent_reply` | `send_cs_reply` | (unconditional) |
+| `send_cs_reply` | END | (unconditional) |
+
+### Daily Reminder Workflow Nodes
+
+| Node Name | Node Type | Key Configuration |
+|-----------|-----------|-------------------|
+| `cron_trigger` | CronTriggerNode | `expression: "0 9 * * *"`, `timezone: "Asia/Shanghai"` |
+| `get_access_token` | WeComAccessTokenNode | `corp_id: {{config.configurable.corp_id}}` |
+| `find_active_users` | MongoDBFindNode | `collection: "registered_users"`, `filter: {"status": "active"}` |
+| `prepare_iteration` | PrepareIterationNode | Custom TaskNode: reads user list, sets `index: 0`, `total: len(users)` |
+| `select_current_user` | SelectCurrentUserNode | Custom TaskNode: picks user at current index, formats personalised message |
+| `send_reminder` | SubWorkflowNode | Contains: WeComCustomerServiceSendNode sending to current user |
+| `increment_counter` | IncrementCounterNode | Custom TaskNode: increments index by 1 |
+
+### Daily Reminder Workflow Edges
+
+| From | To | Condition |
+|------|----|-----------|
+| START | `get_access_token` | (entry point, cron trigger) |
+| `get_access_token` | `find_active_users` | (unconditional) |
+| `find_active_users` | `prepare_iteration` | (unconditional) |
+| `prepare_iteration` | `select_current_user` | While: `index < total` |
+| `prepare_iteration` | END | While: `index >= total` (no users) |
+| `select_current_user` | `send_reminder` | (unconditional) |
+| `send_reminder` | `increment_counter` | (unconditional) |
+| `increment_counter` | `select_current_user` | While: `index < total` |
+| `increment_counter` | END | While: `index >= total` (done) |
+
+## Security Considerations
+
+- **WeCom signature validation**: All incoming callbacks are verified by WeComEventsParserNode using the Token and EncodingAESKey
+- **Secrets management**: All sensitive credentials (WeCom secrets, MongoDB connection string, OpenAI API key) stored in Orcheo Vault using `[[secret_name]]` syntax
+- **Phone number privacy**: Phone numbers stored in MongoDB should be treated as PII; access restricted to the workflow
+- **Input validation**: Agent system prompt enforces phone number format validation; MongoDB operations use parameterised filters (no injection risk)
+- **Soft-delete for deregistration**: User data is not permanently deleted, preserving audit trail
+
+## Performance Considerations
+
+- **Cron batch size**: For large user bases, the SubWorkflow iteration may hit WeCom API rate limits. Consider adding a `DelayNode` between iterations for throttling.
+- **MongoDB indexing**: Create indexes on `registered_users.external_userid` and `user_records.{external_userid, record_date}` for efficient lookups
+- **LLM latency**: GPT-4o-mini typically responds within 2-5 seconds; total message handler latency should stay under 10 seconds
+- **Access token caching**: WeComAccessTokenNode caches tokens internally, avoiding redundant API calls
+
+## Testing Strategy
+
+- **Unit tests**: Custom TaskNode logic (PrepareIterationNode, SelectCurrentUserNode, IncrementCounterNode, ExtractAgentReplyNode)
+- **Integration tests**: End-to-end workflow runs using `orcheo workflow run` with mock WeCom payloads
+- **Agent behaviour tests**: Verify agent correctly handles registration, deregistration, and status report with sample Chinese messages
+- **Cron workflow tests**: Verify iteration logic with mock MongoDB data (0 users, 1 user, multiple users)
+- **Manual QA checklist**:
+  - Register a new user via WeChat message
+  - Attempt duplicate registration (should inform user)
+  - Deregister with confirmation flow
+  - Verify cron reminder delivery at 9 AM
+  - Submit a status report and verify MongoDB record
+
+## Rollout Plan
+
+1. Phase 1: Deploy to local Orcheo instance; test with mock WeCom callbacks via `orcheo workflow run`
+2. Phase 2: Connect to WeCom Customer Service sandbox; test with internal team
+3. Phase 3: Production deployment with real WeCom Customer Service account; gradual user onboarding
+
+---
+
+## Revision History
+
+| Date | Author | Changes |
+|------|--------|---------|
+| 2026-02-23 | ShaojieJiang | Initial draft |

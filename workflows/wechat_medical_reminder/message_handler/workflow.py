@@ -125,22 +125,18 @@ class ExtractAgentReplyNode(TaskNode):
         messages = state.get("messages", [])
         agent_reply = ""
         for msg in messages[::-1]:
-            try:
-                if msg.type == "ai" and msg.content:
-                    agent_reply = msg.content
-                    break
-            except Exception:
-                pass
-            try:
+            if isinstance(msg, dict):
                 if msg.get("role") == "assistant":
-                    agent_reply = msg.get("content", "")
+                    agent_reply = str(msg.get("content", ""))
                     break
-            except Exception:
-                continue
+            elif hasattr(msg, "type") and msg.type == "ai" and msg.content:
+                content = msg.content
+                agent_reply = content if isinstance(content, str) else str(content)
+                break
         return {"agent_reply": agent_reply}
 
 
-async def build_graph() -> StateGraph:
+async def orcheo_workflow() -> StateGraph:
     """Build the Message Handler workflow."""
     graph = StateGraph(State)
 

@@ -105,7 +105,7 @@ class IncrementCounterNode(TaskNode):
         return {"iteration": iteration + 1}
 
 
-async def build_graph() -> StateGraph:
+async def orcheo_workflow() -> StateGraph:
     """Build the Daily Reminder workflow."""
     graph = StateGraph(State)
 

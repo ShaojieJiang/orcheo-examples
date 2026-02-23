@@ -19,7 +19,7 @@ from orcheo.graph.state import State
 from orcheo.nodes.mongodb import MongoDBNode
 
 
-async def build_graph() -> StateGraph:
+async def orcheo_workflow() -> StateGraph:
     """Build the DB Setup workflow."""
     graph = StateGraph(State)
 

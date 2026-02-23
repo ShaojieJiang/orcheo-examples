@@ -66,6 +66,7 @@ no-lines-before = ["future", "standard-library", "third-party", "first-party", "
 max-complexity = 10
 
 [tool.ruff.lint.per-file-ignores]
+"**/__init__.py" = ["D104"]
 "tests/**" = ["D"]
 
 [tool.ruff.lint.pydocstyle]

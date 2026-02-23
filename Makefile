@@ -2,7 +2,7 @@
 
 lint:
 	ruff check .
-	mypy orcheo_examples
+	mypy workflows
 	ruff format . --check
 
 format:

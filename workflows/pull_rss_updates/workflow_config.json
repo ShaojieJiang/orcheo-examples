@@ -1,0 +1,28 @@
+{
+  "configurable": {
+    "rss_sources": [
+      "http://news.ycombinator.com/rss",
+      "http://www.nytimes.com/services/xml/rss/nyt/Technology.xml",
+      "https://openai.com/blog/rss.xml",
+      "http://feeds.simonwillison.net/swn-everything",
+      "http://feeds.arstechnica.com/arstechnica/gadgets",
+      "https://techcrunch.com/feed",
+      "https://rss.beehiiv.com/feeds/2R3C6Bt5wj.xml",
+      "https://news.yahoo.com/rss/tech",
+      "http://www.jiqizhixin.com/rss",
+      "https://www.qbitai.com/feed",
+      "https://every.to/chain-of-thought/feed.xml",
+      "https://deepmind.google/blog/rss.xml",
+      "https://eugeneyan.com/rss/",
+      "https://huyenchip.com/feed",
+      "https://www.oneusefulthing.org/feed",
+      "https://www.aisnakeoil.com/feed",
+      "https://www.latent.space/feed",
+      "https://news.smol.ai/rss.xml",
+      "http://dwarkesh.com/feed",
+      "https://www.lesswrong.com/feed.xml",
+      "https://www.alignmentforum.org/feed.xml",
+      "https://generative.ink/posts/index.xml"
+    ]
+  }
+}

@@ -1,0 +1,285 @@
+{
+  "name": "Pull Updates",
+  "nodes": [
+    {
+      "parameters": {
+        "url": "={{ $json.source }}",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.rssFeedRead",
+      "typeVersion": 1.1,
+      "position": [
+        448,
+        -336
+      ],
+      "id": "6a6404f5-dbc7-4acb-bfcf-65ddd576ba10",
+      "name": "RSS Read"
+    },
+    {
+      "parameters": {
+        "content": "## Prepare RSS feed list",
+        "height": 220,
+        "width": 600,
+        "color": 4
+      },
+      "type": "n8n-nodes-base.stickyNote",
+      "position": [
+        -464,
+        -320
+      ],
+      "typeVersion": 1,
+      "id": "d936351d-5a2a-41fc-8fcc-cbd83a5e7912",
+      "name": "Sticky Note"
+    },
+    {
+      "parameters": {
+        "content": "## Pull feeds and save to DB",
+        "height": 380,
+        "width": 800,
+        "color": 4
+      },
+      "type": "n8n-nodes-base.stickyNote",
+      "position": [
+        208,
+        -480
+      ],
+      "typeVersion": 1,
+      "id": "16850ed1-56ef-4867-9762-545957f5cd43",
+      "name": "Sticky Note1"
+    },
+    {
+      "parameters": {
+        "fieldToSplitOut": "sources",
+        "options": {
+          "destinationFieldName": "source"
+        }
+      },
+      "type": "n8n-nodes-base.splitOut",
+      "typeVersion": 1,
+      "position": [
+        0,
+        -272
+      ],
+      "id": "a74c6bdd-de43-4865-a63f-949e43abcd89",
+      "name": "Split Out"
+    },
+    {
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            {
+              "id": "d73eab18-16ff-4fb8-a294-f223ad35e13b",
+              "name": "sources",
+              "value": "=[\n\"http://news.ycombinator.com/rss\",\n\"http://www.nytimes.com/services/xml/rss/nyt/Technology.xml\",\n\"https://openai.com/blog/rss.xml\",\n\"http://feeds.simonwillison.net/swn-everything\",\n\"http://feeds.arstechnica.com/arstechnica/gadgets\",\n\"https://techcrunch.com/feed\",\n\"https://rss.beehiiv.com/feeds/2R3C6Bt5wj.xml\",\n\"https://news.yahoo.com/rss/tech\",\n\"http://www.jiqizhixin.com/rss\",\n\"https://www.qbitai.com/feed\",\n\"https://every.to/chain-of-thought/feed.xml\",\n\"https://deepmind.google/blog/rss.xml\",\n\"https://eugeneyan.com/rss/\",\n\"https://huyenchip.com/feed\",\n\"https://www.oneusefulthing.org/feed\",\n\"https://www.aisnakeoil.com/feed\",\n\"https://www.latent.space/feed\",\n\"https://news.smol.ai/rss.xml\",\n\"http://dwarkesh.com/feed\",\n\"https://www.lesswrong.com/feed.xml\",\n\"https://www.alignmentforum.org/feed.xml\",\n\"https://generative.ink/posts/index.xml\"\n]",
+              "type": "array"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        -448,
+        -272
+      ],
+      "id": "4180f95d-1c7f-47d3-82f6-edf5bea6565b",
+      "name": "Rss Sources"
+    },
+    {
+      "parameters": {
+        "options": {}
+      },
+      "type": "n8n-nodes-base.splitInBatches",
+      "typeVersion": 3,
+      "position": [
+        224,
+        -272
+      ],
+      "id": "819d414a-4312-467e-b423-30cd55ce5ae0",
+      "name": "For Each Source"
+    },
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "minutes",
+              "minutesInterval": 30
+            }
+          ]
+        }
+      },
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        -656,
+        -272
+      ],
+      "id": "b73fded0-0b90-4cba-ab2d-0af05e986511",
+      "name": "Schedule Trigger"
+    },
+    {
+      "parameters": {
+        "operation": "insert",
+        "collection": "rss_feeds",
+        "fields": "={{ Object.keys($json).join(\",\") }}",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.mongoDb",
+      "typeVersion": 1.1,
+      "position": [
+        880,
+        -272
+      ],
+      "id": "f424cd23-589d-4e15-89ad-8d33f0ed3449",
+      "name": "MongoDB Insert",
+      "credentials": {
+        "mongoDb": {
+          "id": "UH8CNOAPhIu6f7yO",
+          "name": "MongoDB account"
+        }
+      },
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            {
+              "id": "31740e5b-056a-476d-83af-54c6bbfe5851",
+              "name": "read",
+              "value": false,
+              "type": "boolean"
+            }
+          ]
+        },
+        "includeOtherFields": true,
+        "options": {}
+      },
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        672,
+        -336
+      ],
+      "id": "4d8a4ae0-b1a3-4c9f-b638-14f3aef6ee0d",
+      "name": "Add Fields"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Loop over input items and add a new field called 'myNewField' to the JSON of each one\nlet items = $input.first().json.sources;\nconst sources = [...new Set(items)];\nreturn {sources};"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -224,
+        -272
+      ],
+      "id": "a1973cb6-f7f3-45f4-a6fc-4563a7de7639",
+      "name": "Deduplicate"
+    }
+  ],
+  "pinData": {},
+  "connections": {
+    "RSS Read": {
+      "main": [
+        [
+          {
+            "node": "Add Fields",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Split Out": {
+      "main": [
+        [
+          {
+            "node": "For Each Source",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Rss Sources": {
+      "main": [
+        [
+          {
+            "node": "Deduplicate",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "For Each Source": {
+      "main": [
+        [],
+        [
+          {
+            "node": "RSS Read",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Schedule Trigger": {
+      "main": [
+        [
+          {
+            "node": "Rss Sources",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "MongoDB Insert": {
+      "main": [
+        [
+          {
+            "node": "For Each Source",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Add Fields": {
+      "main": [
+        [
+          {
+            "node": "MongoDB Insert",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Deduplicate": {
+      "main": [
+        [
+          {
+            "node": "Split Out",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": true,
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "versionId": "38467676-1275-4916-aa62-2fe00c1397d3",
+  "meta": {
+    "instanceId": "bf1e89d5888460f9dc1ea26a97a886dc8cde1e931310890367f75c0d888ed8d8"
+  },
+  "id": "ihhLdGbpIuBYxl0U",
+  "tags": []
+}

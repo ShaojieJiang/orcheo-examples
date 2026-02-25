@@ -8,6 +8,7 @@ and uploaded via ``--config-file workflow_config.json``.
 """
 
 import datetime
+import re
 from typing import Any
 
 from langchain_core.runnables import RunnableConfig
@@ -44,25 +45,28 @@ def extract_tag_text(xml: str, tag: str) -> str:
 
 def extract_link(xml: str) -> str:
     """Extract link from RSS <link> or Atom <link href='...'>."""
-    # Try Atom-style <link href="..."/>
+    # Try Atom-style <link ... href="..."/> first.
+    fallback_href = ""
     link_start = xml.find("<link")
     while link_start != -1:
         tag_end = xml.find(">", link_start)
         if tag_end == -1:
             break
         tag_content = xml[link_start : tag_end + 1]
-        href_pos = tag_content.find('href="')
-        if href_pos != -1:
-            val_start = href_pos + 6
-            val_end = tag_content.find('"', val_start)
-            if val_end != -1:
-                return tag_content[val_start:val_end]
-        href_pos = tag_content.find("href='")
-        if href_pos != -1:
-            val_start = href_pos + 6
-            val_end = tag_content.find("'", val_start)
-            if val_end != -1:
-                return tag_content[val_start:val_end]
+
+        attrs = {
+            match.group(1).lower(): match.group(3)
+            for match in re.finditer(r"([a-zA-Z_:][-a-zA-Z0-9_:.]*)\s*=\s*(['\"])(.*?)\2", tag_content)
+        }
+
+        href = attrs.get("href", "").strip()
+        rel = attrs.get("rel", "").strip().lower()
+        if href:
+            if rel == "alternate":
+                return href
+            if not fallback_href:
+                fallback_href = href
+
         # RSS-style <link>URL</link>
         if tag_content.endswith("/>"):
             link_start = xml.find("<link", tag_end)
@@ -71,7 +75,7 @@ def extract_link(xml: str) -> str:
         if close != -1:
             return xml[tag_end + 1 : close].strip()
         break
-    return ""
+    return fallback_href
 
 
 def parse_rss_items(body: str) -> list[dict[str, str]]:
@@ -122,6 +126,7 @@ class FetchRSSNode(TaskNode):
         sources = config.get("configurable", {}).get("rss_sources", [])
 
         documents: list[dict[str, Any]] = []
+        errors: list[dict[str, str]] = []
         now = datetime.datetime.utcnow().isoformat()
 
         for url in sources:
@@ -143,10 +148,19 @@ class FetchRSSNode(TaskNode):
                         "fetched_at": now,
                     }
                     documents.append(doc)
-            except Exception:
-                pass
+            except Exception as exc:
+                error = {
+                    "source": url,
+                    "error": f"{type(exc).__name__}: {exc}",
+                }
+                errors.append(error)
 
-        return {"documents": documents, "fetched_count": len(documents)}
+        return {
+            "documents": documents,
+            "errors": errors,
+            "fetched_count": len(documents),
+            "failed_sources": len(errors),
+        }
 
 
 class StoreRSSNode(TaskNode):

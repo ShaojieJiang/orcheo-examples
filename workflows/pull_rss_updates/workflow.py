@@ -8,6 +8,7 @@ and uploaded via ``--config-file workflow_config.json``.
 """
 
 import datetime
+import asyncio
 import re
 from typing import Any
 
@@ -68,13 +69,11 @@ def extract_link(xml: str) -> str:
                 fallback_href = href
 
         # RSS-style <link>URL</link>
-        if tag_content.endswith("/>"):
-            link_start = xml.find("<link", tag_end)
-            continue
         close = xml.find("</link>", tag_end)
-        if close != -1:
+        next_link = xml.find("<link", tag_end)
+        if not href and close != -1 and (next_link == -1 or close < next_link):
             return xml[tag_end + 1 : close].strip()
-        break
+        link_start = next_link
     return fallback_href
 
 
@@ -127,15 +126,22 @@ class FetchRSSNode(TaskNode):
 
         documents: list[dict[str, Any]] = []
         errors: list[dict[str, str]] = []
-        now = datetime.datetime.utcnow().isoformat()
+        now = datetime.datetime.now(datetime.timezone.utc).isoformat()
 
-        for url in sources:
+        async def fetch_source(url: str) -> tuple[list[dict[str, Any]], list[dict[str, str]]]:
+            source_documents: list[dict[str, Any]] = []
+            source_errors: list[dict[str, str]] = []
+
             try:
                 fetcher = HttpRequestNode(name="http_fetch", url=url, timeout=15.0)
                 result = await fetcher.run(state, config)
                 body = result.get("content", "")
                 if not body:
-                    continue
+                    source_errors.append({
+                        "source": url,
+                        "error": "Empty feed response",
+                    })
+                    return source_documents, source_errors
 
                 for item in parse_rss_items(body):
                     doc = {
@@ -147,13 +153,19 @@ class FetchRSSNode(TaskNode):
                         "read": False,
                         "fetched_at": now,
                     }
-                    documents.append(doc)
+                    source_documents.append(doc)
             except Exception as exc:
-                error = {
+                source_errors.append({
                     "source": url,
                     "error": f"{type(exc).__name__}: {exc}",
-                }
-                errors.append(error)
+                })
+
+            return source_documents, source_errors
+
+        results = await asyncio.gather(*(fetch_source(url) for url in sources))
+        for source_documents, source_errors in results:
+            documents.extend(source_documents)
+            errors.extend(source_errors)
 
         return {
             "documents": documents,
@@ -164,7 +176,7 @@ class FetchRSSNode(TaskNode):
 
 
 class StoreRSSNode(TaskNode):
-    """Insert RSS entries into MongoDB."""
+    """Insert or update RSS entries in MongoDB."""
 
     connection_string: str = "[[mdb_connection_string]]"
     database: str = "orcheo"
@@ -173,20 +185,31 @@ class StoreRSSNode(TaskNode):
     async def run(self, state: State, config: RunnableConfig) -> dict[str, Any]:
         documents = state["results"]["fetch_rss"]["documents"]
 
-        inserted_count = 0
+        upserted_count = 0
         if documents:
+            upserts = [
+                {
+                    "filter": {
+                        "source": doc.get("source", ""),
+                        "link": doc.get("link", ""),
+                    },
+                    "update": {"$set": doc},
+                    "upsert": True,
+                }
+                for doc in documents
+            ]
             node = MongoDBNode(
                 name="mongo_insert",
                 connection_string=self.connection_string,
                 database=self.database,
                 collection=self.collection,
-                operation="insert_many",
-                query=documents,
+                operation="upsert_many",
+                query=upserts,
             )
             result = await node.run(state, config)
-            inserted_count = len(result.get("data", []))
+            upserted_count = result.get("upserted_count", 0)
 
-        return {"inserted_count": inserted_count}
+        return {"upserted_count": upserted_count}
 
 
 async def orcheo_workflow() -> StateGraph:

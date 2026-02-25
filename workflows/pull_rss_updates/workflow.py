@@ -7,18 +7,18 @@ RSS source URLs are maintained in the companion ``workflow_config.json``
 and uploaded via ``--config-file workflow_config.json``.
 """
 
-import datetime
 import asyncio
+import datetime
 import re
 from typing import Any
-
 from langchain_core.runnables import RunnableConfig
 from langgraph.graph import END, START, StateGraph
 from orcheo.graph.state import State
 from orcheo.nodes.base import TaskNode
 from orcheo.nodes.data import HttpRequestNode
-from orcheo.nodes.mongodb import MongoDBNode
+from orcheo.nodes.integrations.databases.mongodb.base import MongoDBClientNode
 from orcheo.nodes.triggers import CronTriggerNode
+from pymongo import UpdateOne
 
 
 def extract_tag_text(xml: str, tag: str) -> str:
@@ -57,7 +57,9 @@ def extract_link(xml: str) -> str:
 
         attrs = {
             match.group(1).lower(): match.group(3)
-            for match in re.finditer(r"([a-zA-Z_:][-a-zA-Z0-9_:.]*)\s*=\s*(['\"])(.*?)\2", tag_content)
+            for match in re.finditer(
+                r"([a-zA-Z_:][-a-zA-Z0-9_:.]*)\s*=\s*(['\"])(.*?)\2", tag_content
+            )
         }
 
         href = attrs.get("href", "").strip()
@@ -106,12 +108,14 @@ def parse_rss_items(body: str) -> list[dict[str, str]]:
             if not pub_date:
                 pub_date = extract_tag_text(fragment, "updated")
 
-            items.append({
-                "title": title,
-                "link": link,
-                "description": description,
-                "pubDate": pub_date,
-            })
+            items.append(
+                {
+                    "title": title,
+                    "link": link,
+                    "description": description,
+                    "pubDate": pub_date,
+                }
+            )
 
             pos = end + len(close_tag)
 
@@ -122,13 +126,16 @@ class FetchRSSNode(TaskNode):
     """Fetch all RSS feeds via HTTP and parse entries."""
 
     async def run(self, state: State, config: RunnableConfig) -> dict[str, Any]:
+        """Fetch all RSS feeds via HTTP and parse entries."""
         sources = config.get("configurable", {}).get("rss_sources", [])
 
         documents: list[dict[str, Any]] = []
         errors: list[dict[str, str]] = []
-        now = datetime.datetime.now(datetime.timezone.utc).isoformat()
+        now = datetime.datetime.now(datetime.UTC).isoformat()
 
-        async def fetch_source(url: str) -> tuple[list[dict[str, Any]], list[dict[str, str]]]:
+        async def fetch_source(
+            url: str,
+        ) -> tuple[list[dict[str, Any]], list[dict[str, str]]]:
             source_documents: list[dict[str, Any]] = []
             source_errors: list[dict[str, str]] = []
 
@@ -137,10 +144,12 @@ class FetchRSSNode(TaskNode):
                 result = await fetcher.run(state, config)
                 body = result.get("content", "")
                 if not body:
-                    source_errors.append({
-                        "source": url,
-                        "error": "Empty feed response",
-                    })
+                    source_errors.append(
+                        {
+                            "source": url,
+                            "error": "Empty feed response",
+                        }
+                    )
                     return source_documents, source_errors
 
                 for item in parse_rss_items(body):
@@ -155,10 +164,12 @@ class FetchRSSNode(TaskNode):
                     }
                     source_documents.append(doc)
             except Exception as exc:
-                source_errors.append({
-                    "source": url,
-                    "error": f"{type(exc).__name__}: {exc}",
-                })
+                source_errors.append(
+                    {
+                        "source": url,
+                        "error": f"{type(exc).__name__}: {exc}",
+                    }
+                )
 
             return source_documents, source_errors
 
@@ -175,7 +186,7 @@ class FetchRSSNode(TaskNode):
         }
 
 
-class StoreRSSNode(TaskNode):
+class StoreRSSNode(MongoDBClientNode):
     """Insert or update RSS entries in MongoDB."""
 
     connection_string: str = "[[mdb_connection_string]]"
@@ -183,31 +194,27 @@ class StoreRSSNode(TaskNode):
     collection: str = "rss_feeds"
 
     async def run(self, state: State, config: RunnableConfig) -> dict[str, Any]:
+        """Insert or update RSS entries in MongoDB."""
         documents = state["results"]["fetch_rss"]["documents"]
 
         upserted_count = 0
         if documents:
-            upserts = [
-                {
-                    "filter": {
-                        "source": doc.get("source", ""),
-                        "link": doc.get("link", ""),
-                    },
-                    "update": {"$set": doc},
-                    "upsert": True,
-                }
+            operations = [
+                UpdateOne(
+                    {"source": doc.get("source", ""), "link": doc.get("link", "")},
+                    {"$set": doc},
+                    upsert=True,
+                )
                 for doc in documents
             ]
-            node = MongoDBNode(
-                name="mongo_insert",
-                connection_string=self.connection_string,
-                database=self.database,
-                collection=self.collection,
-                operation="upsert_many",
-                query=upserts,
+            self._ensure_collection()
+            assert self._collection is not None
+            collection = self._collection
+            result = self._execute_operation(
+                context=f"bulk_write into {self.database}.{self.collection}",
+                operation=lambda: collection.bulk_write(operations),
             )
-            result = await node.run(state, config)
-            upserted_count = result.get("upserted_count", 0)
+            upserted_count = result.upserted_count
 
         return {"upserted_count": upserted_count}
 

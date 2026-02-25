@@ -202,7 +202,10 @@ class StoreRSSNode(MongoDBClientNode):
             operations = [
                 UpdateOne(
                     {"source": doc.get("source", ""), "link": doc.get("link", "")},
-                    {"$set": doc},
+                    {
+                        "$set": {k: v for k, v in doc.items() if k != "read"},
+                        "$setOnInsert": {"read": False},
+                    },
                     upsert=True,
                 )
                 for doc in documents

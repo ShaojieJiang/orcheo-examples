@@ -20,6 +20,7 @@ version = "0.0.1"
 
 [tool.mypy]
 disallow_untyped_defs = true
+explicit_package_bases = true
 ignore_missing_imports = true
 python_version = "3.12"
 

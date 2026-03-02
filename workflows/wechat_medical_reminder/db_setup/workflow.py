@@ -44,8 +44,8 @@ async def orcheo_workflow() -> StateGraph:
             database="{{config.configurable.reminder_database}}",
             collection="{{config.configurable.user_records_collection}}",
             operation="create_index",
-            query={"external_userid": 1, "record_date": 1},
-            options={"name": "idx_userid_date", "unique": True},
+            query={"external_userid": 1, "open_kf_id": 1, "record_date": 1},
+            options={"name": "idx_userid_kfid_date", "unique": True},
         ),
     )
 

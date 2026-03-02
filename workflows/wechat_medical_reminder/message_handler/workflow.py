@@ -62,9 +62,10 @@ external_userid + open_kf_id 组合
    - 如果用户注册状态为 inactive 或未注册，拒绝记录并提示用户需要先注册
    - 用户报告每日健康状态时，提取各提醒项目的完成情况
    - 用 mongodb_update_one (upsert: true) 在 user_records 中创建记录：
-     filter: {"external_userid": "<id>", "record_date": "<YYYY-MM-DD>"}
+     filter: {"external_userid": "<id>", "open_kf_id": "<id>", \
+"record_date": "<YYYY-MM-DD>"}
      update: {"$set": {raw_text, items_status, recorded_at, external_userid, \
-record_date}}
+open_kf_id, record_date}}
    - 确认已记录并总结状态
 
 4. 其他消息：
@@ -106,10 +107,11 @@ class PrepareAgentContextNode(TaskNode):
             "你是一个微信健康提醒助理。"
             "你通过自然语言对话帮助用户管理健康提醒注册和每日状态记录。\n\n"
             "上下文（以下为实际值，请在工具调用中直接使用）：\n"
-            f"- external_userid: <value>{wecom_data.get('external_userid')}</value>\n"
+            "- external_userid: "
+            f"<value>{wecom_data.get('external_userid', '')}</value>\n"
             "- external_username: "
-            f"<value>{wecom_data.get('external_username')}</value>\n"
-            f"- open_kf_id: <value>{wecom_data.get('open_kf_id')}</value>\n"
+            f"<value>{wecom_data.get('external_username', '')}</value>\n"
+            f"- open_kf_id: <value>{wecom_data.get('open_kf_id', '')}</value>\n"
             f"- 当前日期: {now.date().isoformat()}\n"
             f"- 当前时间: {now.isoformat()}\n" + user_status_line + "\nMongoDB 配置：\n"
             f"- database: {configurable.get('reminder_database')}\n"

@@ -81,7 +81,7 @@ Both workflows communicate with external WeChat users exclusively through the We
 1. Registered user sends a status report message (e.g., "今天药已经吃了，血压130/85")
 2. Steps 2-6 same as Flow 1
 3. Agent detects status-report intent, extracts structured data from the message
-4. Agent calls `mongodb_update_one` on `user_records` with `upsert: true`, using filter `{"external_userid": "<id>", "record_date": "<today>"}` and the extracted status data
+4. Agent calls `mongodb_update_one` on `user_records` with `upsert: true`, using filter `{"external_userid": "<id>", "open_kf_id": "<id>", "record_date": "<today>"}` and the extracted status data
 5. Agent generates a confirmation reply (e.g., "已记录今日状态：降压药已服用，血压130/85")
 6. Reply is sent to user via `WeComCustomerServiceSendNode`
 
@@ -89,7 +89,7 @@ Both workflows communicate with external WeChat users exclusively through the We
 
 1. Admin triggers the DB Setup workflow manually via `orcheo workflow run`
 2. `create_registered_users_index` node (MongoDBNode, operation: `create_index`) creates a compound ascending unique index on `{external_userid, open_kf_id}` in the `registered_users` collection — implicitly creating the database and collection if they don't exist. The compound key ensures uniqueness per user-per-KF-account rather than globally per user
-3. `create_user_records_index` node (MongoDBNode, operation: `create_index`) creates a compound ascending index on `{external_userid, record_date}` in the `user_records` collection — implicitly creating the collection if it doesn't exist
+3. `create_user_records_index` node (MongoDBNode, operation: `create_index`) creates a compound ascending unique index on `{external_userid, open_kf_id, record_date}` in the `user_records` collection — implicitly creating the collection if it doesn't exist
 4. Both operations are idempotent: re-running the workflow is safe
 
 ## API Contracts
@@ -107,11 +107,12 @@ WeCom sends callbacks to this endpoint.
 ### Orcheo Vault Credentials
 
 ```
-wecom_app_secret       - WeCom app secret for access token
-wecom_token            - Callback token for signature validation
-wecom_encoding_aes_key - AES key for callback decryption
-mdb_connection_string  - MongoDB connection string
-openai_api_key         - OpenAI API key for the LLM agent
+wecom_app_secret_medical_reminder - WeCom app secret for access token
+wecom_corp_id                     - WeCom corp ID
+wecom_token                       - Callback token for signature validation
+wecom_encoding_aes_key            - AES key for callback decryption
+mdb_connection_string             - MongoDB connection string
+openai_api_key                    - OpenAI API key for the LLM agent
 ```
 
 ### Workflow Configurable Inputs
@@ -121,7 +122,6 @@ These values should be specified in the workflow's config file (e.g., `workflow.
 ```json
 {
   "configurable": {
-    "corp_id": "<WeCom corp ID>",
     "reminder_database": "<MongoDB database name>",
     "registered_users_collection": "registered_users",
     "user_records_collection": "user_records"
@@ -160,6 +160,7 @@ These values should be specified in the workflow's config file (e.g., `workflow.
 | Field | Type | Description |
 |-------|------|-------------|
 | external_userid | string | WeChat external user ID (foreign key to registered_users) |
+| open_kf_id | string | WeCom Customer Service account ID (ensures per-account data isolation) |
 | record_date | string | Date of the record in `YYYY-MM-DD` format |
 | raw_text | string | Original user message text |
 | items_status | object | Structured status per reminder item |
@@ -168,6 +169,7 @@ These values should be specified in the workflow's config file (e.g., `workflow.
 ```json
 {
   "external_userid": "wmXXXXXXXXXX",
+  "open_kf_id": "wkXXXXXXXXXX",
   "record_date": "2026-02-23",
   "raw_text": "今天药已经吃了，血压130/85，没有走路",
   "items_status": {
@@ -226,9 +228,9 @@ MongoDB 配置：
    - 如果用户注册状态为 inactive 或未注册，拒绝记录并提示用户需要先注册
    - 用户报告每日健康状态时，提取各提醒项目的完成情况
    - 用 mongodb_update_one (upsert: true) 在 user_records 中创建记录：
-     filter: {"external_userid": "<id>", "record_date": "<YYYY-MM-DD>"}
+     filter: {"external_userid": "<id>", "open_kf_id": "<id>", "record_date": "<YYYY-MM-DD>"}
      update: {"$set": {raw_text, items_status, recorded_at, external_userid,
-     record_date}}
+     open_kf_id, record_date}}
    - 确认已记录并总结状态
 
 4. 其他消息：
@@ -251,8 +253,8 @@ MongoDB 配置：
 | Node Name | Node Type | Key Configuration |
 |-----------|-----------|-------------------|
 | `webhook_trigger` | WebhookTriggerNode | `allowed_methods: ["GET", "POST"]` |
-| `wecom_events_parser` | WeComEventsParserNode | `corp_id: {{config.configurable.corp_id}}` |
-| `get_cs_access_token` | WeComAccessTokenNode | `corp_id: {{config.configurable.corp_id}}` |
+| `wecom_events_parser` | WeComEventsParserNode | (defaults) |
+| `get_cs_access_token` | WeComAccessTokenNode | `app_secret: [[wecom_app_secret_medical_reminder]]` |
 | `wecom_cs_sync` | WeComCustomerServiceSyncNode | (defaults) |
 | `lookup_user` | MongoDBFindNode | `filter: {external_userid, open_kf_id}`, `limit: 1` — looks up current registration status |
 | `prepare_agent_context` | PrepareAgentContextNode | Custom TaskNode: builds the system prompt with resolved context values (user IDs, date, registration status, MongoDB config) |
@@ -282,7 +284,7 @@ MongoDB 配置：
 | Node Name | Node Type | Key Configuration |
 |-----------|-----------|-------------------|
 | `cron_trigger` | CronTriggerNode | `expression: "0 9 * * *"`, `timezone: "Asia/Shanghai"` |
-| `get_access_token` | WeComAccessTokenNode | `corp_id: {{config.configurable.corp_id}}` |
+| `get_access_token` | WeComAccessTokenNode | `app_secret: [[wecom_app_secret_medical_reminder]]` |
 | `find_active_users` | MongoDBFindNode | `collection: "registered_users"`, `filter: {"status": "active", "external_userid": {"$exists": true, "$ne": ""}, "open_kf_id": {"$exists": true, "$ne": ""}}` |
 | `for_each_user` | ForLoopNode | `items: {{find_active_users.data}}` — iterates over users, exposes `current_item` and `done` |
 | `prepare_message` | PrepareMessageNode | Custom TaskNode: reads `for_each_user.current_item`, formats personalised message from `reminder_items` and `external_username` |
@@ -308,7 +310,7 @@ MongoDB 配置：
 | Node Name | Node Type | Key Configuration |
 |-----------|-----------|-------------------|
 | `create_registered_users_index` | MongoDBNode | `operation: "create_index"`, `collection: "registered_users"`, `keys: {"external_userid": 1, "open_kf_id": 1}`, `kwargs: {"name": "idx_userid_kfid", "unique": true}` |
-| `create_user_records_index` | MongoDBNode | `operation: "create_index"`, `collection: "user_records"`, `keys: {"external_userid": 1, "record_date": 1}`, `kwargs: {"name": "idx_userid_date"}` |
+| `create_user_records_index` | MongoDBNode | `operation: "create_index"`, `collection: "user_records"`, `keys: {"external_userid": 1, "open_kf_id": 1, "record_date": 1}`, `kwargs: {"name": "idx_userid_kfid_date", "unique": true}` |
 
 ### DB Setup Workflow Edges
 
@@ -329,7 +331,7 @@ MongoDB 配置：
 ## Performance Considerations
 
 - **Cron batch size**: For large user bases, the ForLoopNode iteration may hit WeCom API rate limits. Consider adding a `DelayNode` between iterations for throttling.
-- **MongoDB indexing**: Compound unique index on `registered_users.{external_userid, open_kf_id}` enforces per-user-per-KF-account uniqueness; compound unique index on `user_records.{external_userid, record_date}` for efficient lookups
+- **MongoDB indexing**: Compound unique index on `registered_users.{external_userid, open_kf_id}` enforces per-user-per-KF-account uniqueness; compound unique index on `user_records.{external_userid, open_kf_id, record_date}` for per-account-isolated daily lookups
 - **LLM latency**: GPT-4o-mini typically responds within 2-5 seconds; total message handler latency should stay under 10 seconds
 - **Access token caching**: WeComAccessTokenNode caches tokens internally, avoiding redundant API calls
 
@@ -361,3 +363,4 @@ MongoDB 配置：
 | 2026-02-23 | ShaojieJiang | Initial draft |
 | 2026-02-23 | ShaojieJiang | Added DB Setup workflow (Flow 5) for admin-driven MongoDB provisioning |
 | 2026-03-02 | ShaojieJiang | Updated for ForLoopNode refactor: replaced SubWorkflow/While loop with ForLoopNode; added persist_reminder_history, lookup_user, prepare_agent_context nodes; updated agent system prompt example; fixed registered_users index to compound {external_userid, open_kf_id} |
+| 2026-03-02 | ShaojieJiang | Added open_kf_id to user_records filter/index for full per-account isolation; fixed vault secret names; removed stale corp_id configurable; added open_kf_id to user_records data model |

@@ -11,19 +11,19 @@
 
 ## Overview
 
-The WeChat Medical Reminder system is built on the Orcheo workflow platform and consists of two workflows that share two MongoDB collections. The **Message Handler Workflow** processes incoming WeChat messages via WeCom Customer Service webhooks. An AI agent (AgentNode) interprets user intent and manages registration, deregistration, and status reporting through MongoDB tool calls. The **Daily Reminder Workflow** runs on a cron schedule at 9:00 AM Asia/Shanghai, retrieves all active users, and sends personalised reminders through a SubWorkflow-per-user iteration pattern.
+The WeChat Medical Reminder system is built on the Orcheo workflow platform and consists of two workflows that share two MongoDB collections. The **Message Handler Workflow** processes incoming WeChat messages via WeCom Customer Service webhooks. An AI agent (AgentNode) interprets user intent and manages registration, deregistration, and status reporting through MongoDB tool calls. The **Daily Reminder Workflow** runs on a cron schedule at 9:00 AM Asia/Shanghai, retrieves all active users, and sends personalised reminders via a ForLoopNode iteration. Each sent reminder is also persisted to the LangGraph graph store so the agent can reference reminder context when the user replies.
 
 Both workflows communicate with external WeChat users exclusively through the WeCom Customer Service (微信客服) channel, requiring no WeCom internal account on the user's side.
 
 ## Components
 
 - **Message Handler Workflow (webhook-triggered)**
-  - Receives WeCom callback events, validates signatures, syncs customer service messages, and routes them to an AI agent for processing
-  - Key nodes: WebhookTriggerNode, WeComEventsParserNode, WeComAccessTokenNode, WeComCustomerServiceSyncNode, AgentNode, ExtractAgentReplyNode, WeComCustomerServiceSendNode
+  - Receives WeCom callback events, validates signatures, syncs customer service messages, looks up user registration, and routes them to an AI agent for processing
+  - Key nodes: WebhookTriggerNode, WeComEventsParserNode, WeComAccessTokenNode, WeComCustomerServiceSyncNode, MongoDBFindNode, PrepareAgentContextNode (custom), AgentNode, AgentReplyExtractorNode, WeComCustomerServiceSendNode
 
 - **Daily Reminder Workflow (cron-triggered)**
-  - Fetches all active registered users and sends personalised reminders via SubWorkflow iteration
-  - Key nodes: CronTriggerNode, WeComAccessTokenNode, MongoDBFindNode, PrepareIterationNode (custom), SelectCurrentUserNode (custom), SubWorkflowNode, IncrementCounterNode (custom), WeComCustomerServiceSendNode
+  - Fetches all active registered users and sends personalised reminders via ForLoopNode iteration, persisting each reminder to the graph store for agent conversation history
+  - Key nodes: CronTriggerNode, WeComAccessTokenNode, MongoDBFindNode, ForLoopNode, PrepareMessageNode (custom), WeComCustomerServiceSendNode, GraphStoreAppendMessageNode
 
 - **DB Setup Workflow (manual trigger)**
   - One-time (idempotent) admin workflow to create the required MongoDB database, collections, and indexes
@@ -68,13 +68,13 @@ Both workflows communicate with external WeChat users exclusively through the We
 
 1. `CronTriggerNode` fires at 09:00 Asia/Shanghai daily
 2. `WeComAccessTokenNode` fetches/caches the access token
-3. `MongoDBFindNode` queries `registered_users` with filter `{"status": "active"}`
-4. `PrepareIterationNode` reads the user list and initialises iteration state (`index: 0`, `total: N`)
-5. `While` edge checks: `index < total`
-6. `SelectCurrentUserNode` picks the user at the current index and prepares a personalised reminder message from their `reminder_items`
-7. `SubWorkflowNode` executes a mini-workflow containing `WeComCustomerServiceSendNode` to deliver the message to that user
-8. `IncrementCounterNode` advances the index
-9. Loop continues from step 5 until all users have been sent reminders
+3. `MongoDBFindNode` queries `registered_users` with filter `{"status": "active"}` (also requires `external_userid` and `open_kf_id` to exist and be non-empty)
+4. `ForLoopNode` (`for_each_user`) receives the user list and exposes one user per iteration via `current_item`
+5. Conditional edge checks `for_each_user.done`: if falsy, proceed to loop body; if truthy, go to END
+6. `PrepareMessageNode` reads the current user from `for_each_user.current_item` and formats a personalised reminder from their `reminder_items` and `external_username`
+7. `WeComCustomerServiceSendNode` (`send_reminder`) delivers the message (`raise_on_error=False` so one failure doesn't abort the batch)
+8. `GraphStoreAppendMessageNode` (`persist_reminder_history`) persists the sent reminder to the LangGraph graph store under key `wecom_cs:{open_kf_id}:{external_userid}`, making it available as conversation history when the user later replies to the Message Handler agent
+9. Loop back to `for_each_user` for the next iteration; continues until all users have been processed
 
 ### Flow 4: User Status Report
 
@@ -88,7 +88,7 @@ Both workflows communicate with external WeChat users exclusively through the We
 ### Flow 5: Database Setup (Admin)
 
 1. Admin triggers the DB Setup workflow manually via `orcheo workflow run`
-2. `create_registered_users_index` node (MongoDBNode, operation: `create_index`) creates an ascending index on `external_userid` in the `registered_users` collection — implicitly creating the database and collection if they don't exist
+2. `create_registered_users_index` node (MongoDBNode, operation: `create_index`) creates a compound ascending unique index on `{external_userid, open_kf_id}` in the `registered_users` collection — implicitly creating the database and collection if they don't exist. The compound key ensures uniqueness per user-per-KF-account rather than globally per user
 3. `create_user_records_index` node (MongoDBNode, operation: `create_index`) creates a compound ascending index on `{external_userid, record_date}` in the `user_records` collection — implicitly creating the collection if it doesn't exist
 4. Both operations are idempotent: re-running the workflow is safe
 
@@ -181,20 +181,24 @@ These values should be specified in the workflow's config file (e.g., `workflow.
 
 ## Agent System Prompt (Message Handler)
 
-The AgentNode in the Message Handler Workflow uses the following system prompt:
+The AgentNode in the Message Handler Workflow uses a dynamically-built system prompt assembled by `PrepareAgentContextNode`. The context section resolves all variables at runtime — template placeholders below show where dynamic values are injected:
 
 ```
 你是一个微信健康提醒助理。你通过自然语言对话帮助用户管理健康提醒注册和每日状态记录。
 
-上下文：
-- external_userid: {{wecom_cs_sync.external_userid}}
-- open_kf_id: {{wecom_cs_sync.open_kf_id}}
-- 当前日期: 使用 ISO 8601 格式
+上下文（以下为实际值，请在工具调用中直接使用）：
+- external_userid: <value>{resolved from wecom_cs_sync}</value>
+- external_username: <value>{resolved from wecom_cs_sync}</value>
+- open_kf_id: <value>{resolved from wecom_cs_sync}</value>
+- 当前日期: 2026-02-23            ← concrete ISO date
+- 当前时间: 2026-02-23T09:00:00+08:00  ← concrete ISO datetime
+- 用户注册状态: active/inactive/未注册  ← from lookup_user result
+- 提醒项目: ["吃降压药", "测血压"]     ← only if registered
 
 MongoDB 配置：
-- database: 使用 configurable 中的 reminder_database
-- registered_users collection: registered_users
-- user_records collection: user_records
+- database: {configurable.reminder_database}
+- registered_users collection: {configurable.registered_users_collection}
+- user_records collection: {configurable.user_records_collection}
 
 工具：
 - mongodb_find：查询文档（支持 filter/sort/limit）
@@ -204,10 +208,11 @@ MongoDB 配置：
 
 1. 用户注册：
    - 从用户消息中提取提醒项目列表和手机号
-   - 先用 mongodb_find 检查 registered_users 中是否已存在该 external_userid
+   - 先用 mongodb_find 检查 registered_users 中是否已存在该
+     external_userid + open_kf_id 组合
    - 如不存在，用 mongodb_update_one (upsert: true) 创建记录，包含：
-     external_userid, open_kf_id, phone_number, reminder_items, status: "active",
-     registered_at, updated_at
+     external_userid, external_username, open_kf_id, phone_number,
+     reminder_items, status: "active", registered_at, updated_at
    - 如已存在且 status 为 active，提示用户已注册
    - 确认注册并列出已保存的提醒项目
 
@@ -217,10 +222,13 @@ MongoDB 配置：
    - 确认注销完成
 
 3. 状态报告：
+   - 只有注册状态为 active 的用户才能报告状态
+   - 如果用户注册状态为 inactive 或未注册，拒绝记录并提示用户需要先注册
    - 用户报告每日健康状态时，提取各提醒项目的完成情况
    - 用 mongodb_update_one (upsert: true) 在 user_records 中创建记录：
      filter: {"external_userid": "<id>", "record_date": "<YYYY-MM-DD>"}
-     update: {"$set": {raw_text, items_status, recorded_at, external_userid, record_date}}
+     update: {"$set": {raw_text, items_status, recorded_at, external_userid,
+     record_date}}
    - 确认已记录并总结状态
 
 4. 其他消息：
@@ -231,6 +239,9 @@ MongoDB 配置：
 - 对破坏性操作（注销）必须先确认
 - 手机号格式验证：中国大陆手机号（11位，1开头）
 - 提醒项目应以简洁短语存储
+- 在合适的场景下使用用户的 external_username 称呼用户，如问候、确认操作等
+- 所有 mongodb 查询和更新必须同时使用 external_userid 和 open_kf_id 作为筛选条件，
+  确保不同客服账号的数据互相独立
 ```
 
 ## Node & Edge Configuration
@@ -243,20 +254,25 @@ MongoDB 配置：
 | `wecom_events_parser` | WeComEventsParserNode | `corp_id: {{config.configurable.corp_id}}` |
 | `get_cs_access_token` | WeComAccessTokenNode | `corp_id: {{config.configurable.corp_id}}` |
 | `wecom_cs_sync` | WeComCustomerServiceSyncNode | (defaults) |
-| `agent` | AgentNode | `ai_model: "openai:gpt-4o-mini"`, `predefined_tools: ["mongodb_find", "mongodb_update_one"]`, system prompt above |
-| `extract_agent_reply` | ExtractAgentReplyNode | (custom TaskNode) |
+| `lookup_user` | MongoDBFindNode | `filter: {external_userid, open_kf_id}`, `limit: 1` — looks up current registration status |
+| `prepare_agent_context` | PrepareAgentContextNode | Custom TaskNode: builds the system prompt with resolved context values (user IDs, date, registration status, MongoDB config) |
+| `agent` | AgentNode | `ai_model: "openai:gpt-4o-mini"`, `predefined_tools: ["mongodb_find", "mongodb_update_one"]`, `use_graph_chat_history: true`, `history_key_candidates: ["wecom_cs:{open_kf_id}:{external_userid}"]` |
+| `extract_agent_reply` | AgentReplyExtractorNode | `fallback_message: "抱歉，处理您的请求时遇到了问题，请稍后再试。"` |
 | `send_cs_reply` | WeComCustomerServiceSendNode | `message: {{extract_agent_reply.agent_reply}}` |
 
 ### Message Handler Workflow Edges
 
 | From | To | Condition |
 |------|----|-----------|
-| START | `wecom_events_parser` | (entry point) |
-| `wecom_events_parser` | END | If `immediate_response` is truthy OR `should_process` is falsy |
+| START | `webhook_trigger` | (entry point) |
+| `webhook_trigger` | `wecom_events_parser` | (unconditional) |
+| `wecom_events_parser` | END | If `immediate_response` is truthy |
 | `wecom_events_parser` | `get_cs_access_token` | Otherwise |
 | `get_cs_access_token` | `wecom_cs_sync` | (unconditional) |
 | `wecom_cs_sync` | END | If `should_process` is falsy |
-| `wecom_cs_sync` | `agent` | Otherwise |
+| `wecom_cs_sync` | `lookup_user` | Otherwise |
+| `lookup_user` | `prepare_agent_context` | (unconditional) |
+| `prepare_agent_context` | `agent` | (unconditional) |
 | `agent` | `extract_agent_reply` | (unconditional) |
 | `extract_agent_reply` | `send_cs_reply` | (unconditional) |
 | `send_cs_reply` | END | (unconditional) |
@@ -267,31 +283,31 @@ MongoDB 配置：
 |-----------|-----------|-------------------|
 | `cron_trigger` | CronTriggerNode | `expression: "0 9 * * *"`, `timezone: "Asia/Shanghai"` |
 | `get_access_token` | WeComAccessTokenNode | `corp_id: {{config.configurable.corp_id}}` |
-| `find_active_users` | MongoDBFindNode | `collection: "registered_users"`, `filter: {"status": "active"}` |
-| `prepare_iteration` | PrepareIterationNode | Custom TaskNode: reads user list, sets `index: 0`, `total: len(users)` |
-| `select_current_user` | SelectCurrentUserNode | Custom TaskNode: picks user at current index, formats personalised message |
-| `send_reminder` | SubWorkflowNode | Contains: WeComCustomerServiceSendNode sending to current user |
-| `increment_counter` | IncrementCounterNode | Custom TaskNode: increments index by 1 |
+| `find_active_users` | MongoDBFindNode | `collection: "registered_users"`, `filter: {"status": "active", "external_userid": {"$exists": true, "$ne": ""}, "open_kf_id": {"$exists": true, "$ne": ""}}` |
+| `for_each_user` | ForLoopNode | `items: {{find_active_users.data}}` — iterates over users, exposes `current_item` and `done` |
+| `prepare_message` | PrepareMessageNode | Custom TaskNode: reads `for_each_user.current_item`, formats personalised message from `reminder_items` and `external_username` |
+| `send_reminder` | WeComCustomerServiceSendNode | `raise_on_error: false` — sends to current user; failures don't abort the batch |
+| `persist_reminder_history` | GraphStoreAppendMessageNode | `key: "wecom_cs:{open_kf_id}:{external_userid}"` — persists the reminder as conversation history for the Message Handler agent |
 
 ### Daily Reminder Workflow Edges
 
 | From | To | Condition |
 |------|----|-----------|
-| START | `get_access_token` | (entry point, cron trigger) |
+| START | `cron_trigger` | (entry point) |
+| `cron_trigger` | `get_access_token` | (unconditional) |
 | `get_access_token` | `find_active_users` | (unconditional) |
-| `find_active_users` | `prepare_iteration` | (unconditional) |
-| `prepare_iteration` | `select_current_user` | While: `index < total` |
-| `prepare_iteration` | END | While: `index >= total` (no users) |
-| `select_current_user` | `send_reminder` | (unconditional) |
-| `send_reminder` | `increment_counter` | (unconditional) |
-| `increment_counter` | `select_current_user` | While: `index < total` |
-| `increment_counter` | END | While: `index >= total` (done) |
+| `find_active_users` | `for_each_user` | (unconditional) |
+| `for_each_user` | `prepare_message` | IfElse: `for_each_user.done` is falsy (more users) |
+| `for_each_user` | END | IfElse: `for_each_user.done` is truthy (all done) |
+| `prepare_message` | `send_reminder` | (unconditional) |
+| `send_reminder` | `persist_reminder_history` | (unconditional) |
+| `persist_reminder_history` | `for_each_user` | (unconditional, loop back) |
 
 ### DB Setup Workflow Nodes
 
 | Node Name | Node Type | Key Configuration |
 |-----------|-----------|-------------------|
-| `create_registered_users_index` | MongoDBNode | `operation: "create_index"`, `collection: "registered_users"`, `keys: {"external_userid": 1}`, `kwargs: {"name": "idx_external_userid"}` |
+| `create_registered_users_index` | MongoDBNode | `operation: "create_index"`, `collection: "registered_users"`, `keys: {"external_userid": 1, "open_kf_id": 1}`, `kwargs: {"name": "idx_userid_kfid", "unique": true}` |
 | `create_user_records_index` | MongoDBNode | `operation: "create_index"`, `collection: "user_records"`, `keys: {"external_userid": 1, "record_date": 1}`, `kwargs: {"name": "idx_userid_date"}` |
 
 ### DB Setup Workflow Edges
@@ -312,14 +328,14 @@ MongoDB 配置：
 
 ## Performance Considerations
 
-- **Cron batch size**: For large user bases, the SubWorkflow iteration may hit WeCom API rate limits. Consider adding a `DelayNode` between iterations for throttling.
-- **MongoDB indexing**: Create indexes on `registered_users.external_userid` and `user_records.{external_userid, record_date}` for efficient lookups
+- **Cron batch size**: For large user bases, the ForLoopNode iteration may hit WeCom API rate limits. Consider adding a `DelayNode` between iterations for throttling.
+- **MongoDB indexing**: Compound unique index on `registered_users.{external_userid, open_kf_id}` enforces per-user-per-KF-account uniqueness; compound unique index on `user_records.{external_userid, record_date}` for efficient lookups
 - **LLM latency**: GPT-4o-mini typically responds within 2-5 seconds; total message handler latency should stay under 10 seconds
 - **Access token caching**: WeComAccessTokenNode caches tokens internally, avoiding redundant API calls
 
 ## Testing Strategy
 
-- **Unit tests**: Custom TaskNode logic (PrepareIterationNode, SelectCurrentUserNode, IncrementCounterNode, ExtractAgentReplyNode)
+- **Unit tests**: Custom TaskNode logic (PrepareMessageNode, PrepareAgentContextNode)
 - **Integration tests**: End-to-end workflow runs using `orcheo workflow run` with mock WeCom payloads
 - **Agent behaviour tests**: Verify agent correctly handles registration, deregistration, and status report with sample Chinese messages
 - **Cron workflow tests**: Verify iteration logic with mock MongoDB data (0 users, 1 user, multiple users)
@@ -344,3 +360,4 @@ MongoDB 配置：
 |------|--------|---------|
 | 2026-02-23 | ShaojieJiang | Initial draft |
 | 2026-02-23 | ShaojieJiang | Added DB Setup workflow (Flow 5) for admin-driven MongoDB provisioning |
+| 2026-03-02 | ShaojieJiang | Updated for ForLoopNode refactor: replaced SubWorkflow/While loop with ForLoopNode; added persist_reminder_history, lookup_user, prepare_agent_context nodes; updated agent system prompt example; fixed registered_users index to compound {external_userid, open_kf_id} |

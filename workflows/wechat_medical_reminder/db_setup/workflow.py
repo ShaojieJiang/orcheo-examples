@@ -23,7 +23,7 @@ async def orcheo_workflow() -> StateGraph:
     """Build the DB Setup workflow."""
     graph = StateGraph(State)
 
-    # --- Create registered_users collection + index on external_userid ---
+    # --- Create registered_users collection + compound index ---
     graph.add_node(
         "create_registered_users_index",
         MongoDBNode(
@@ -31,8 +31,8 @@ async def orcheo_workflow() -> StateGraph:
             database="{{config.configurable.reminder_database}}",
             collection=("{{config.configurable.registered_users_collection}}"),
             operation="create_index",
-            query={"external_userid": 1},
-            options={"name": "idx_external_userid", "unique": True},
+            query={"external_userid": 1, "open_kf_id": 1},
+            options={"name": "idx_userid_kfid", "unique": True},
         ),
     )
 

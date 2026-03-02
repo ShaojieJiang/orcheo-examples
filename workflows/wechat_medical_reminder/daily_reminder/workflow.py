@@ -4,68 +4,41 @@ Cron-triggered workflow that sends personalised health reminders to all
 active registered users daily at 9:00 AM Asia/Shanghai.
 
 Configurable inputs (workflow_config.json):
-- corp_id (WeCom corp ID)
 - reminder_database (MongoDB database name)
 - registered_users_collection (collection for user profiles)
 
 Orcheo vault secrets required:
 - wecom_app_secret_medical_reminder: WeCom app secret for access token
+- wecom_corp_id: WeCom corp ID
 - mdb_connection_string: MongoDB connection string
 """
 
-from collections.abc import Mapping
 from typing import Any
 from langchain_core.runnables import RunnableConfig
 from langgraph.graph import END, StateGraph
-from orcheo.edges import Condition, While
+from orcheo.edges import Condition, IfElse
 from orcheo.graph.state import State
 from orcheo.nodes.base import TaskNode
+from orcheo.nodes.logic import ForLoopNode
 from orcheo.nodes.mongodb import MongoDBFindNode
-from orcheo.nodes.sub_workflow import SubWorkflowNode
+from orcheo.nodes.storage import GraphStoreAppendMessageNode
 from orcheo.nodes.triggers import CronTriggerNode
-from orcheo.nodes.wecom import WeComAccessTokenNode
+from orcheo.nodes.wecom import WeComAccessTokenNode, WeComCustomerServiceSendNode
 
 
-class PrepareIterationNode(TaskNode):
-    """Read the user list from MongoDBFindNode and initialise iteration state."""
+class PrepareMessageNode(TaskNode):
+    """Prepare the personalised reminder message for the current user.
 
-    async def run(self, state: State, config: RunnableConfig) -> dict[str, Any]:
-        """Return the user list and total count for the While loop."""
-        results = state.get("results", {})
-        find_result = results.get("find_active_users", {})
-        if not isinstance(find_result, Mapping):
-            return {"users": [], "total": 0}
-        users = find_result.get("data", [])
-        if not isinstance(users, list):
-            users = []
-        return {"users": users, "total": len(users)}
-
-
-class SelectCurrentUserNode(TaskNode):
-    """Pick the user at the current loop index and format a reminder message."""
+    Reads the current user from ForLoopNode output each iteration.
+    """
 
     async def run(self, state: State, config: RunnableConfig) -> dict[str, Any]:
         """Return the personalised message and user identifiers."""
         results = state.get("results", {})
-        users = results.get("prepare_iteration", {}).get("users", [])
+        user = results.get("for_each_user", {}).get("current_item", {})
+        if not isinstance(user, dict):
+            return {"message": "", "external_userid": "", "open_kf_id": ""}
 
-        # iteration is written by the increment node (name="loop_users") via
-        # the LangGraph reducer.  Before the first increment it defaults to 0.
-        loop_state = results.get("loop_users", {})
-        iteration = 0
-        if isinstance(loop_state, Mapping):
-            raw = loop_state.get("iteration", 0)
-            iteration = int(raw) if raw is not None else 0
-        index = max(iteration, 0)
-
-        if index >= len(users):
-            return {
-                "message": "",
-                "external_userid": "",
-                "open_kf_id": "",
-            }
-
-        user = users[index]
         username = user.get("external_username", "")
         items = user.get("reminder_items", [])
         if isinstance(items, list) and items:
@@ -84,25 +57,6 @@ class SelectCurrentUserNode(TaskNode):
             "external_userid": user.get("external_userid", ""),
             "open_kf_id": user.get("open_kf_id", ""),
         }
-
-
-class IncrementCounterNode(TaskNode):
-    """Advance the While loop counter via the LangGraph reducer.
-
-    The node **must** be instantiated with ``name="loop_users"`` so that its
-    output is stored in ``results["loop_users"]``, which is the state key the
-    ``While`` edge reads for its iteration counter.
-    """
-
-    async def run(self, state: State, config: RunnableConfig) -> dict[str, Any]:
-        """Increment and persist the iteration counter."""
-        results = state.get("results", {})
-        loop_state = results.get("loop_users", {})
-        iteration = 0
-        if isinstance(loop_state, Mapping):
-            raw = loop_state.get("iteration", 0)
-            iteration = int(raw) if raw is not None else 0
-        return {"iteration": iteration + 1}
 
 
 async def orcheo_workflow() -> StateGraph:
@@ -124,7 +78,6 @@ async def orcheo_workflow() -> StateGraph:
         "get_access_token",
         WeComAccessTokenNode(
             name="get_access_token",
-            corp_id="{{config.configurable.corp_id}}",
             app_secret="[[wecom_app_secret_medical_reminder]]",
         ),
     )
@@ -136,86 +89,74 @@ async def orcheo_workflow() -> StateGraph:
             name="find_active_users",
             database="{{config.configurable.reminder_database}}",
             collection="{{config.configurable.registered_users_collection}}",
-            filter={"status": "active"},
+            filter={
+                "status": "active",
+                "external_userid": {"$exists": True, "$ne": ""},
+                "open_kf_id": {"$exists": True, "$ne": ""},
+            },
         ),
     )
 
-    # --- Iteration setup ---
+    # --- ForLoop over users ---
     graph.add_node(
-        "prepare_iteration",
-        PrepareIterationNode(name="prepare_iteration"),
+        "for_each_user",
+        ForLoopNode(
+            name="for_each_user",
+            items="{{find_active_users.data}}",
+        ),
     )
-
-    # --- Per-user nodes ---
     graph.add_node(
-        "select_current_user",
-        SelectCurrentUserNode(name="select_current_user"),
+        "prepare_message",
+        PrepareMessageNode(name="prepare_message"),
     )
     graph.add_node(
         "send_reminder",
-        SubWorkflowNode(
+        WeComCustomerServiceSendNode(
             name="send_reminder",
-            steps=[
-                {
-                    "type": "WeComCustomerServiceSendNode",
-                    "name": "send_message",
-                    "open_kf_id": "{{select_current_user.open_kf_id}}",
-                    "external_userid": ("{{select_current_user.external_userid}}"),
-                    "message": "{{select_current_user.message}}",
-                },
-            ],
+            open_kf_id="{{prepare_message.open_kf_id}}",
+            external_userid="{{prepare_message.external_userid}}",
+            message="{{prepare_message.message}}",
+            raise_on_error=False,
         ),
     )
     graph.add_node(
-        "increment_counter",
-        IncrementCounterNode(name="loop_users"),
+        "persist_reminder_history",
+        GraphStoreAppendMessageNode(
+            name="persist_reminder_history",
+            key="wecom_cs:{{prepare_message.open_kf_id}}:{{prepare_message.external_userid}}",
+            content="{{prepare_message.message}}",
+        ),
     )
 
     # --- Edges ---
     graph.set_entry_point("cron_trigger")
     graph.add_edge("cron_trigger", "get_access_token")
     graph.add_edge("get_access_token", "find_active_users")
-    graph.add_edge("find_active_users", "prepare_iteration")
+    graph.add_edge("find_active_users", "for_each_user")
 
-    # While loop: entry check after prepare_iteration
-    loop_entry = While(
-        name="loop_users",
+    # ForLoop routes: body or done
+    loop_router = IfElse(
+        name="for_each_user_router",
         conditions=[
             Condition(
-                operator="less_than",
-                right="{{prepare_iteration.total}}",
+                left="{{for_each_user.done}}",
+                operator="is_falsy",
             ),
         ],
     )
     graph.add_conditional_edges(
-        "prepare_iteration",
-        loop_entry,
+        "for_each_user",
+        loop_router,
         {
-            "continue": "select_current_user",
-            "exit": END,
+            "true": "prepare_message",
+            "false": END,
         },
     )
 
-    graph.add_edge("select_current_user", "send_reminder")
-    graph.add_edge("send_reminder", "increment_counter")
+    graph.add_edge("prepare_message", "send_reminder")
+    graph.add_edge("send_reminder", "persist_reminder_history")
 
-    # While loop: continuation check after increment_counter
-    loop_continue = While(
-        name="loop_users",
-        conditions=[
-            Condition(
-                operator="less_than",
-                right="{{prepare_iteration.total}}",
-            ),
-        ],
-    )
-    graph.add_conditional_edges(
-        "increment_counter",
-        loop_continue,
-        {
-            "continue": "select_current_user",
-            "exit": END,
-        },
-    )
+    # After persisting history, loop back to for_each_user
+    graph.add_edge("persist_reminder_history", "for_each_user")
 
     return graph

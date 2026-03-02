@@ -4,7 +4,6 @@ Webhook-triggered workflow that handles user registration, deregistration,
 and status reporting via an AI agent with MongoDB tools.
 
 Configurable inputs (workflow_config.json):
-- corp_id (WeCom corp ID)
 - reminder_database (MongoDB database name)
 - registered_users_collection (collection for user profiles)
 - user_records_collection (collection for status reports)
@@ -24,7 +23,7 @@ from langchain_core.runnables import RunnableConfig
 from langgraph.graph import END, StateGraph
 from orcheo.edges import Condition, IfElse
 from orcheo.graph.state import State
-from orcheo.nodes.ai import AgentNode
+from orcheo.nodes.ai import AgentNode, AgentReplyExtractorNode
 from orcheo.nodes.base import TaskNode
 from orcheo.nodes.mongodb import MongoDBFindNode
 from orcheo.nodes.triggers import WebhookTriggerNode
@@ -45,7 +44,8 @@ AGENT_INSTRUCTIONS = """\
 
 1. 用户注册：
    - 从用户消息中提取提醒项目列表和手机号
-   - 先用 mongodb_find 检查 registered_users 中是否已存在该 external_userid
+   - 先用 mongodb_find 检查 registered_users 中是否已存在该 \
+external_userid + open_kf_id 组合
    - 如不存在，用 mongodb_update_one (upsert: true) 创建记录，包含：
      external_userid, external_username, open_kf_id, phone_number, reminder_items,
      status: "active", registered_at, updated_at
@@ -75,7 +75,9 @@ record_date}}
 - 对破坏性操作（注销）必须先确认
 - 手机号格式验证：中国大陆手机号（11位，1开头）
 - 提醒项目应以简洁短语存储
-- 在合适的场景下使用用户的 external_username 称呼用户，如问候、确认操作等"""
+- 在合适的场景下使用用户的 external_username 称呼用户，如问候、确认操作等
+- 所有 mongodb 查询和更新必须同时使用 external_userid 和 open_kf_id 作为筛选条件，\
+确保不同客服账号的数据互相独立"""
 
 
 class PrepareAgentContextNode(TaskNode):
@@ -119,27 +121,6 @@ class PrepareAgentContextNode(TaskNode):
         return {"system_prompt": system_prompt}
 
 
-class ExtractAgentReplyNode(TaskNode):
-    """Extract the final text reply from the AgentNode output messages."""
-
-    async def run(self, state: State, config: RunnableConfig) -> dict[str, Any]:
-        """Return the agent's last assistant message as plain text."""
-        messages = state.get("messages", [])
-        agent_reply = ""
-        for msg in messages[::-1]:
-            if isinstance(msg, dict):
-                if msg.get("role") == "assistant":
-                    agent_reply = str(msg.get("content", ""))
-                    break
-            elif not isinstance(msg, dict) and msg.type == "ai" and msg.content:
-                content = msg.content
-                agent_reply = content if isinstance(content, str) else str(content)
-                break
-        if not agent_reply:
-            agent_reply = "抱歉，处理您的请求时遇到了问题，请稍后再试。"
-        return {"agent_reply": agent_reply}
-
-
 async def orcheo_workflow() -> StateGraph:
     """Build the Message Handler workflow."""
     graph = StateGraph(State)
@@ -158,14 +139,12 @@ async def orcheo_workflow() -> StateGraph:
         "wecom_events_parser",
         WeComEventsParserNode(
             name="wecom_events_parser",
-            corp_id="{{config.configurable.corp_id}}",
         ),
     )
     graph.add_node(
         "get_cs_access_token",
         WeComAccessTokenNode(
             name="get_cs_access_token",
-            corp_id="{{config.configurable.corp_id}}",
             app_secret="[[wecom_app_secret_medical_reminder]]",
         ),
     )
@@ -181,7 +160,10 @@ async def orcheo_workflow() -> StateGraph:
             name="lookup_user",
             database="{{config.configurable.reminder_database}}",
             collection="{{config.configurable.registered_users_collection}}",
-            filter={"external_userid": "{{wecom_cs_sync.external_userid}}"},
+            filter={
+                "external_userid": "{{wecom_cs_sync.external_userid}}",
+                "open_kf_id": "{{wecom_cs_sync.open_kf_id}}",
+            },
             limit=1,
         ),
     )
@@ -201,13 +183,20 @@ async def orcheo_workflow() -> StateGraph:
             model_kwargs={"api_key": "[[openai_api_key]]"},
             system_prompt="{{prepare_agent_context.system_prompt}}",
             predefined_tools=["mongodb_find", "mongodb_update_one"],
+            use_graph_chat_history=True,
+            history_key_candidates=[
+                "wecom_cs:{{results.wecom_cs_sync.open_kf_id}}:{{results.wecom_cs_sync.external_userid}}",
+            ],
         ),
     )
 
     # --- Reply path ---
     graph.add_node(
         "extract_agent_reply",
-        ExtractAgentReplyNode(name="extract_agent_reply"),
+        AgentReplyExtractorNode(
+            name="extract_agent_reply",
+            fallback_message="抱歉，处理您的请求时遇到了问题，请稍后再试。",
+        ),
     )
     graph.add_node(
         "send_cs_reply",

@@ -1,0 +1,6 @@
+{
+  "configurable": {
+    "reminder_database": "medical_reminder",
+    "registered_users_collection": "registered_users"
+  }
+}

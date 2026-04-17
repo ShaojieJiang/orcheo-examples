@@ -5,7 +5,7 @@ from orcheo.graph.state import State
 from orcheo.nodes.linkedin import LinkedInPostNode
 
 
-def build_graph() -> StateGraph:
+def orcheo_workflow() -> StateGraph:
     """Build the LinkedIn posting workflow."""
     graph = StateGraph(State)
     graph.add_node(
